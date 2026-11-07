@@ -4,6 +4,7 @@
 // =====================================================================
 import { buildPortfolio, parseCsv, normalizeTx, TIPOS, DEFAULT_ALERT_CONFIG } from "./engine.js";
 import { createFirebaseStore, createMemoryStore } from "./data.js";
+import { buildTaxReport, tickersHeldAt, yearsWithData } from "./tax.js";
 import { firebaseConfig, proxyUrl } from "./config.js";
 
 const DEFAULT_NEWS_KEYWORDS = [
@@ -211,6 +212,7 @@ function renderSide() {
     ${S.isOwner ? `<button class="btn primary" data-a="new-tx">+ Nuevo movimiento</button>` : ""}
     <div class="grow"></div>
     <button class="act" data-a="refresh" ${S.busy ? "disabled" : ""}>${S.busy ? '<span class="spin">↻</span> Actualizando precios' : "↻ Actualizar precios"}</button>
+    <button class="act" data-a="tax">Resumen fiscal</button>
     ${S.isOwner ? `<button class="act" data-a="prices">Precios manuales</button><button class="act" data-a="import">Importar CSV</button><button class="act" data-a="config">Configuración</button>` : ""}
     <button class="act" data-a="logout">Cerrar sesión</button>
   </aside>`;
@@ -385,6 +387,7 @@ function renderMas() {
       ${S.isOwner ? `<button data-a="prices">Precios manuales<span>Si falta algún precio</span></button>
       <button data-a="import">Importar CSV<span>Varios movimientos a la vez</span></button>
       <button data-a="config">Configuración<span>Brokers, tickers, alertas, acceso</span></button>` : ""}
+      <button data-a="tax">Resumen fiscal<span>Excel para la declaración de renta</span></button>
     </div>
     <div class="menu" style="margin-top:16px"><button class="danger" data-a="logout">Cerrar sesión<span>${esc(S.user.email || "")}</span></button></div>
     ${S.isOwner ? "" : `<p class="small muted" style="margin-top:16px">Tienes acceso de solo lectura.</p>`}`;
@@ -471,11 +474,63 @@ function txSheet(bId, id) {
     t.cantidad ? ["Cantidad", num(t.cantidad)] : null,
     t.precio ? ["Precio", money(t.precio)] : null,
     ["Efecto en el efectivo", `<span class="${t.monto < 0 ? "loss" : "gain"}">${signedMoney(t.monto)}</span>`],
+    t.retencion ? ["Impuesto retenido", money(t.retencion)] : null,
     t.periodo ? ["Periodo", esc(t.periodo)] : null,
     t.nota ? ["Nota", esc(t.nota)] : null,
   ].filter(Boolean);
   openSheet(TIPOS[t.tipo] ? TIPOS[t.tipo].label : t.tipo, `<dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
     ${S.isOwner ? `<div class="btn-row"><button class="btn" data-a="edit-tx" data-b="${esc(bId)}" data-id="${esc(id)}">Editar</button><button class="btn danger" data-a="del-tx" data-b="${esc(bId)}" data-id="${esc(id)}">Borrar</button></div>` : ""}`);
+}
+
+// ---------------------------------------------------------- resumen fiscal
+const CLOSES_KEY = "pf_closes_v1";
+function taxForm(year) {
+  const years = yearsWithData(S.txs);
+  const thisYear = Number(todayStr().slice(0, 4));
+  if (!years.includes(thisYear)) years.unshift(thisYear);
+  // por defecto, el último año completo (el que se declara)
+  const Y = year || (years.find((y) => y < thisYear) ?? thisYear);
+  const parcial = Y === thisYear;
+  const held = tickersHeldAt(S.brokers, S.txs, Y, todayStr());
+  const saved = (readLS(CLOSES_KEY)[Y]) || {};
+  const live = {};
+  for (const t of S.pf.tickers) live[t.ticker] = t.price;
+  const trm = (readLS(CLOSES_KEY).trm || {})[Y] || "";
+  const body = `
+    <div class="field"><label>Año</label><select id="tx-year" data-a-change="tax-year">${years.map((y) => `<option value="${y}" ${y === Y ? "selected" : ""}>${y}${y === thisYear ? " (en curso)" : ""}</option>`).join("")}</select></div>
+    <p class="small muted" style="margin-top:-4px">${parcial ? `El año no ha terminado: el corte es hoy, ${fmtDate(todayStr())}, con los precios actuales.` : `Corte al 31 de diciembre de ${Y}.`}
+      ${S.view === "mine" || !S.isOwner ? "" : " El archivo trae el total de cada cuenta y tu parte."}</p>
+    ${held.length ? `<h4 style="margin:16px 0 4px">Precios de cierre</h4>
+      <div class="hint" style="margin:0 0 10px">${parcial ? "Puedes ajustarlos si quieres otra fecha." : `Precio al cierre del último día hábil de ${Y}. Lo encuentras en el certificado del broker o en Yahoo Finance (Historical data). Si dejas uno vacío, esa celda queda amarilla en el Excel.`}</div>
+      <div class="grid3">${held.map((tk) => {
+        const v = saved[tk] ?? (parcial && live[tk] ? live[tk].toFixed(2) : "");
+        return `<div class="field"><label>${esc(tk)}</label><input class="tx-close" data-tk="${esc(tk)}" type="number" step="any" inputmode="decimal" value="${esc(v)}"></div>`;
+      }).join("")}</div>` : ""}
+    <div class="field" style="margin-top:6px"><label>TRM al corte (opcional)</label><input id="tx-trm" type="number" step="any" inputmode="decimal" placeholder="Ej. 4,000.00" value="${esc(trm)}"></div>
+    <div class="hint">Con la TRM, el Excel calcula los valores en pesos. Si no la tienes, tu contadora puede escribirla en la celda amarilla.</div>
+    <button class="btn primary block" style="margin-top:16px" data-a="tax-download" data-y="${Y}">Descargar Excel</button>`;
+  openSheet("Resumen fiscal", body);
+  document.getElementById("tx-year").addEventListener("change", (e) => taxForm(Number(e.target.value)));
+}
+
+async function taxDownload(btn) {
+  const Y = Number(btn.dataset.y);
+  const closes = {};
+  document.querySelectorAll(".tx-close").forEach((i) => { if (i.value !== "") closes[i.dataset.tk] = Number(i.value); });
+  const trm = val("tx-trm");
+  const store = readLS(CLOSES_KEY);
+  store[Y] = closes; store.trm = { ...(store.trm || {}), [Y]: trm };
+  writeLS(CLOSES_KEY, store);
+  btn.disabled = true; btn.textContent = "Preparando…";
+  try {
+    const personas = { [S.access.shareKey || "andres"]: S.access.nombre || "Yo" };
+    if (S.isOwner) { try { for (const a of await S.store.listAccess()) if (a.shareKey && a.nombre && a.rol !== "owner") personas[a.shareKey] = a.nombre; } catch {} }
+    const report = buildTaxReport({ brokers: S.brokers, txs: S.txs, year: Y, shareKey: S.access.shareKey || "andres", closes, today: todayStr() });
+    const { downloadTaxExcel } = await import("./tax-excel.js");
+    const name = await downloadTaxExcel(report, { trm: trm ? Number(trm) : null, personas, quien: S.access.nombre || S.user.nombre, base: import.meta.url });
+    toast(`Descargado ${name}`);
+  } catch (e) { toast("Error: " + e.message, 4000); }
+  btn.disabled = false; btn.textContent = "Descargar Excel";
 }
 
 // --------------------------------------------------------------- noticias
@@ -560,15 +615,17 @@ function txForm(edit) {
     } else if (tp === "dividendo_reinvertido" || tp === "compra_reinversion") {
       h = tickerSel(false) + `<div class="grid3"><div class="field"><label>Monto dividendo</label><input id="f-m" type="number" step="any" inputmode="decimal" value="${t ? Math.abs(t.monto) : ""}"></div>
         <div class="field"><label>Acciones recibidas</label><input id="f-q" type="number" step="any" inputmode="decimal" value="${t ? t.cantidad : ""}"></div>
-        <div class="field"><label>Precio</label><input id="f-p" type="number" step="any" inputmode="decimal" value="${t ? t.precio : ""}"></div></div>`;
+        <div class="field"><label>Precio</label><input id="f-p" type="number" step="any" inputmode="decimal" value="${t ? t.precio : ""}"></div></div>
+        ${tp === "dividendo_reinvertido" ? `<div class="grid2">${retField(t)}</div>` : ""}`;
     } else if (tp === "dividendo") {
-      h = tickerSel(false) + `<div class="field"><label>Monto recibido</label><input id="f-m" type="number" step="any" inputmode="decimal" value="${t ? t.monto : ""}"></div>`;
+      h = tickerSel(false) + `<div class="grid2"><div class="field"><label>Monto recibido</label><input id="f-m" type="number" step="any" inputmode="decimal" value="${t ? t.monto : ""}"></div>${retField(t)}</div>`;
     } else if (tp === "comision") {
       h = tickerSel(true) + `<div class="field"><label>Monto de la comisión</label><input id="f-m" type="number" step="any" inputmode="decimal" value="${t ? Math.abs(t.monto) : ""}"></div>`;
     } else if (tp === "interes") {
       const f = val("f-fecha") || todayStr();
       h = `<div class="grid2"><div class="field"><label>Monto del interés</label><input id="f-m" type="number" step="any" inputmode="decimal" value="${t ? t.monto : ""}"></div>
         <div class="field"><label>Mes al que corresponde</label><input id="f-per" type="month" value="${esc(t && t.periodo ? t.periodo : prevMonthStr(f))}"></div></div>
+        <div class="grid2">${retField(t)}</div>
         <div class="hint">Reemplaza la estimación automática de ese mes.</div>`;
     } else if (tp === "transferencia") {
       h = `<div class="grid2"><div class="field"><label>Dirección</label><select id="f-dir"><option value="in" ${t && t.monto < 0 ? "" : "selected"}>Entra a este broker</option><option value="out" ${t && t.monto < 0 ? "selected" : ""}>Sale de este broker</option></select></div>
@@ -595,6 +652,10 @@ function txForm(edit) {
   dyn();
 }
 
+function retField(t) {
+  return `<div class="field"><label>Impuesto retenido (opcional)</label><input id="f-ret" type="number" step="any" inputmode="decimal" placeholder="0.00" value="${t && t.retencion ? t.retencion : ""}"></div>`;
+}
+
 function buildTxFromForm(quiet) {
   const tp = val("f-tipo"), fecha = val("f-fecha"), nota = val("f-nota") || undefined;
   const n = (id) => { const v = val(id); return v === "" ? null : Number(v); };
@@ -610,6 +671,9 @@ function buildTxFromForm(quiet) {
     } else ticker = sel.value || null;
   }
   const q = n("f-q"), p = n("f-p"), c = n("f-c") || 0, m = n("f-m");
+  const ret = n("f-ret");
+  if (ret != null && (isNaN(ret) || ret < 0)) return { error: "Impuesto retenido inválido" };
+  const R = ret ? { retencion: ret } : {};
   const need = (x, msg) => (x == null || isNaN(x) || x <= 0 ? msg : null);
   let txs = [], err = null;
   if (tp === "compra" || tp === "venta") {
@@ -621,16 +685,16 @@ function buildTxFromForm(quiet) {
     err = (!ticker && "Elige un ticker") || need(m, "Monto inválido") || need(q, "Cantidad inválida") || need(p, "Precio inválido");
     if (!err) txs = tp === "compra_reinversion"
       ? [{ tipo: "compra_reinversion", ticker, cantidad: q, precio: p, monto: -m }]
-      : [{ tipo: "dividendo", ticker, monto: m }, { tipo: "compra_reinversion", ticker, cantidad: q, precio: p, monto: -m }];
+      : [{ tipo: "dividendo", ticker, monto: m, ...R }, { tipo: "compra_reinversion", ticker, cantidad: q, precio: p, monto: -m }];
   } else if (tp === "dividendo") {
     err = (!ticker && "Elige un ticker") || need(m, "Monto inválido");
-    if (!err) txs = [{ tipo: "dividendo", ticker, monto: m }];
+    if (!err) txs = [{ tipo: "dividendo", ticker, monto: m, ...R }];
   } else if (tp === "comision") {
     err = need(m, "Monto inválido");
     if (!err) txs = [{ tipo: "comision", ticker: ticker || null, monto: -m }];
   } else if (tp === "interes") {
     err = (m == null || isNaN(m) ? "Monto inválido" : null) || (!/^\d{4}-\d{2}$/.test(val("f-per")) ? "Mes inválido" : null);
-    if (!err) txs = [{ tipo: "interes", monto: m, periodo: val("f-per") }];
+    if (!err) txs = [{ tipo: "interes", monto: m, periodo: val("f-per"), ...R }];
   } else if (tp === "transferencia") {
     err = need(m, "Monto inválido");
     if (!err) txs = [{ tipo: "transferencia", monto: val("f-dir") === "out" ? -m : m }];
@@ -757,8 +821,8 @@ async function configForm() {
         <div class="field"><label>Fecha ancla (opcional)</label><input class="b-anchor" type="date" value="${esc(b.anchorDate || "")}"></div></div>
       <div class="hint" style="margin:-4px 0 8px">Ancla: solo si no tienes el historial de depósitos de este broker (como Schwab hasta ahora). Déjala vacía si importas depósitos.</div>
       <div class="grid3">${keys.map((k) => `<div class="field"><label>Participación ${esc(k)} %</label><input class="b-share" data-k="${esc(k)}" type="number" step="any" value="${b.shares && b.shares[k] != null ? +(b.shares[k] * 100).toFixed(4) : ""}"></div>`).join("")}</div>
-      <div class="grid2"><div class="field"><label>Rendimiento del efectivo</label><select class="b-base"><option value="">No genera intereses</option><option value="EA" ${b.interes && b.interes.base !== "nominal" && tasas.length ? "selected" : ""}>Tasa efectiva anual (EA)</option><option value="nominal" ${b.interes && b.interes.base === "nominal" ? "selected" : ""}>Tasa nominal anual</option></select></div>
-        <div class="field"><label>Tasas (desde AAAA-MM-DD = %, una por línea)</label><textarea class="b-tasas" style="min-height:60px">${tasas.map((t) => `${t.desde} = ${+(t.tasa * 100).toFixed(4)}`).join("\n")}</textarea></div></div>
+      <div class="grid2"><div class="field"><label>Rendimiento del efectivo</label><select class="b-base"><option value="">No genera intereses</option><option value="EA" ${(b.interes && b.interes.base !== "nominal" && tasas.length) || (!b.interes && b.id === "tyba") ? "selected" : ""}>Tasa efectiva anual (EA)</option><option value="nominal" ${b.interes && b.interes.base === "nominal" ? "selected" : ""}>Tasa nominal anual</option></select></div>
+        <div class="field"><label>Tasa anual en %, desde una fecha</label><textarea class="b-tasas" style="min-height:60px" placeholder="2026-01-01 = 3.5">${tasas.map((t) => `${t.desde} = ${+(t.tasa * 100).toFixed(4)}`).join("\n")}</textarea></div></div>
       <button class="btn sm" data-a="save-broker" data-id="${esc(b.id)}">Guardar ${esc(b.nombre)}</button></div>`;
   };
   openSheet("Configuración", `
@@ -811,9 +875,11 @@ async function saveBrokerCfg(id) {
   const base = card.querySelector(".b-base").value;
   const tasas = [];
   for (const line of card.querySelector(".b-tasas").value.split("\n").map((l) => l.trim()).filter(Boolean)) {
-    const m = line.match(/^(\d{4}-\d{2}-\d{2})\s*=\s*([\d.,]+)\s*%?$/);
-    if (!m) { toast(`Línea de tasa inválida: "${line}"`); return; }
-    tasas.push({ desde: m[1], tasa: Number(m[2].replace(",", ".")) / 100 });
+    // acepta "2026-01-01 = 3.5", "2026-01-01 3,5%", "2026-01-01: 3.5" o solo "3.5" (aplica desde siempre)
+    const m = line.match(/^(?:(\d{4}-\d{2}-\d{2})\s*[=:]?\s*)?(\d+(?:[.,]\d+)?)\s*%?$/);
+    const tasa = m ? Number(m[2].replace(",", ".")) : NaN;
+    if (!m || !(tasa >= 0 && tasa < 100)) { toast(`No entendí la tasa "${line}". Escríbela así: 2026-01-01 = 3.5`); return; }
+    tasas.push({ desde: m[1] || "2000-01-01", tasa: tasa / 100 });
   }
   const data = {
     nombre: card.querySelector(".b-nombre").value.trim() || id,
@@ -915,6 +981,9 @@ document.addEventListener("click", (e) => {
     case "imp-check": importCheck(); break;
     case "imp-go": importGo(el); break;
     case "config": configForm(); break;
+    case "tax": taxForm(); break;
+    case "tax-year": taxForm(Number(el.value)); break;
+    case "tax-download": taxDownload(el); break;
     case "save-broker": saveBrokerCfg(id); break;
     case "new-broker": newBroker(); break;
     case "save-tickers": saveTickers(); break;

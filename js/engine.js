@@ -97,6 +97,9 @@ export function normalizeTx(t) {
   tx.precio = tx.precio === "" || tx.precio == null ? null : Number(tx.precio);
   tx.monto = Number(tx.monto);
   tx.ticker = tx.ticker ? String(tx.ticker).trim().toUpperCase() : null;
+  // impuesto retenido en la fuente (positivo); el monto ya viene neto
+  if (tx.retencion === "" || tx.retencion == null || isNaN(Number(tx.retencion)) || Number(tx.retencion) <= 0) delete tx.retencion;
+  else tx.retencion = Number(tx.retencion);
   return tx;
 }
 
@@ -166,7 +169,7 @@ export function estimateInterest(broker, txs, todayN) {
  * el saldo inicial + todo lo posterior; lo anterior ya está dentro de ese
  * saldo. El mismo día del ancla solo cuentan movimientos sin ticker.
  */
-function inCashScope(t, anchorN) {
+export function inCashScope(t, anchorN) {
   if (t.tipo === "saldo_inicial") return true;
   if (anchorN == null) return true;
   const n = dnum(t.fecha);
@@ -175,7 +178,7 @@ function inCashScope(t, anchorN) {
   return true;
 }
 
-function brokerAnchor(broker, txs) {
+export function brokerAnchor(broker, txs) {
   if (broker.anchorDate) return dnum(broker.anchorDate);
   const si = txs.find((t) => t.tipo === "saldo_inicial");
   return si ? dnum(si.fecha) : null;
@@ -449,7 +452,7 @@ export function buildPortfolio(p) {
 }
 
 // ---------------------------------------------------------- CSV import
-/** CSV con encabezado: broker,fecha,ticker,tipo,cantidad,precio,monto[,periodo,nota] */
+/** CSV con encabezado: broker,fecha,ticker,tipo,cantidad,precio,monto[,periodo,nota,retencion] */
 export function parseCsv(text) {
   const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim());
   if (!lines.length) return { rows: [], errors: ["Archivo vacío"] };
@@ -476,6 +479,7 @@ export function parseCsv(text) {
         cantidad: r.cantidad, precio: r.precio, monto: r.monto,
         ...(r.periodo ? { periodo: r.periodo } : {}),
         ...(r.nota ? { nota: r.nota } : {}),
+        ...(r.retencion ? { retencion: r.retencion } : {}),
       }),
     });
   });
